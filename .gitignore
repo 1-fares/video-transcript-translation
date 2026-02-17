@@ -1,0 +1,35 @@
+# Dependencies
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Output files
+*.mp3
+*.mp4
+*.txt
+!.gitkeep
+
+# Downloaded test assets (auto-fetched by test suite)
+test_video.*
+
+# Linting
+.ruff_cache/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets
+.env
+
+# OS
+.DS_Store
+Thumbs.db
