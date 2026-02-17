@@ -11,6 +11,9 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+local = [
+    "faster-whisper>=1.0.0",
+]
 
 [tool.pytest.ini_options]
 markers = [

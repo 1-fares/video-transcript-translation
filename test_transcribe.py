@@ -144,7 +144,8 @@ class TestIntegration:
                 "text",
                 "--output",
                 output_path,
-                "--no-translate",
+                "--translate-to",
+                "none",
             ],
         )
         main()
@@ -191,7 +192,7 @@ class TestIntegration:
         with open(output_path, encoding="utf-8") as f:
             content = f.read()
         assert "[Language: french]" in content or "[Language: fr]" in content
-        assert "=== English Translation ===" in content
+        assert "=== Translation (en) ===" in content
 
     @pytest.mark.integration
     def test_translate_only(self, test_video, tmp_path, monkeypatch):
@@ -209,7 +210,7 @@ class TestIntegration:
         assert os.path.isfile(output_path)
         with open(output_path, encoding="utf-8") as f:
             content = f.read()
-        assert "=== English Translation ===" in content
+        assert "=== Translation (en) ===" in content
 
 
 if __name__ == "__main__":

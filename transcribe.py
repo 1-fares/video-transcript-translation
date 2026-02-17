@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Transcribe video/audio files using OpenAI's Whisper API.
-Auto-detects language and includes an English translation if the audio is not in English.
+Auto-detects language and optionally translates using Whisper (English) or GPT-4o-mini (other languages).
 
 Usage:
     python transcribe.py <file>
     python transcribe.py <file> --language fr --format srt
     python transcribe.py <file> --output subtitles.vtt --format vtt
-    python transcribe.py <file> --no-translate
+    python transcribe.py <file> --translate-to none
+    python transcribe.py <file> --translate-to fr
     python transcribe.py <file> --translate-only
     python transcribe.py <file> --chunk-minutes 5
 
@@ -15,6 +16,9 @@ Requires:
     pip install openai
     ffmpeg/ffprobe on PATH
     OPENAI_API_KEY in .env or environment
+
+Optional local fallback (auto-used if API fails):
+    uv pip install -e ".[local]"
 """
 
 import argparse
@@ -245,6 +249,47 @@ def translate_chunk(client: OpenAI, audio_path: str) -> str:
     return response.text
 
 
+@retry_on_failure(max_retries=3)
+def translate_text_gpt(client: OpenAI, text: str, target_language: str) -> str:
+    """Translate text to target_language using GPT-4o-mini."""
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": f"Translate the following to {target_language}. Return only the translation, no commentary.",
+            },
+            {"role": "user", "content": text},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _load_local_model(model_size: str = "base") -> object | None:
+    """Load a faster-whisper model for local fallback. Returns None if not installed."""
+    try:
+        from faster_whisper import WhisperModel
+        return WhisperModel(model_size, device="cpu", compute_type="int8")
+    except ImportError:
+        return None
+
+
+def transcribe_chunk_local(
+    model, audio_path: str, language: str | None = None, task: str = "transcribe"
+) -> dict:
+    """Transcribe or translate a single audio chunk using a local faster-whisper model."""
+    segments_gen, info = model.transcribe(
+        audio_path, task=task, language=language, beam_size=5,
+    )
+    segments = [Segment(start=s.start, end=s.end, text=s.text) for s in segments_gen]
+    return {
+        "text": " ".join(s.text.strip() for s in segments),
+        "language": info.language,
+        "segments": segments,
+        "duration": info.duration,
+    }
+
+
 def main():
     _load_dotenv()
 
@@ -266,9 +311,10 @@ def main():
         "--output", "-o", help="Output file path (auto-generated if omitted)"
     )
     parser.add_argument(
-        "--no-translate",
-        action="store_true",
-        help="Skip English translation (text format only)",
+        "--translate-to",
+        default="en",
+        metavar="LANG",
+        help="Target language for translation (default: en). Use 'none' to skip.",
     )
     parser.add_argument(
         "--translate-only",
@@ -287,11 +333,13 @@ def main():
     if not os.path.isfile(args.file):
         sys.exit(f"File not found: {args.file}")
 
-    if args.no_translate and args.format != "text":
+    translate_to = args.translate_to.lower()
+
+    if args.translate_only and translate_to not in ("en", "none"):
         print(
-            f"Warning: --no-translate has no effect with --format {args.format} "
-            "(translation is only available for text format)"
+            "Warning: --translate-only requires transcription for non-English targets; transcribing first."
         )
+        args.translate_only = False
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -313,6 +361,36 @@ def main():
         ext = ext_map.get(args.format, "txt")
         output_path = str(Path(args.file).with_suffix(f".{ext}"))
 
+    # Local model state — initialized lazily on first API failure
+    local_model = None
+
+    def get_local_model():
+        nonlocal local_model
+        if local_model is None:
+            local_model = _load_local_model()
+            if local_model is None:
+                raise RuntimeError(
+                    "faster-whisper not installed; run: uv pip install -e '.[local]'"
+                )
+        return local_model
+
+    def transcribe_with_fallback(chunk, language):
+        try:
+            return transcribe_chunk(client, chunk, language)
+        except Exception as e:
+            print(f"\n  API error ({e}), falling back to local model...")
+            model = get_local_model()
+            return transcribe_chunk_local(model, chunk, language)
+
+    def translate_with_fallback(chunk):
+        try:
+            return translate_chunk(client, chunk)
+        except Exception as e:
+            print(f"\n  API error ({e}), falling back to local model...")
+            model = get_local_model()
+            result = transcribe_chunk_local(model, chunk, task="translate")
+            return result["text"]
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         audio_path = os.path.join(tmp_dir, "audio.mp3")
         extract_audio(args.file, audio_path)
@@ -328,7 +406,7 @@ def main():
                 print(
                     f"  Translating chunk {i + 1}/{len(chunks)}...", end="", flush=True
                 )
-                translations.append(translate_chunk(client, chunk))
+                translations.append(translate_with_fallback(chunk))
                 print(" done")
             full_transcript = "\n".join(translations).strip()
             print(f"Translation complete: {len(full_transcript)} chars")
@@ -340,7 +418,7 @@ def main():
                 print(
                     f"  Transcribing chunk {i + 1}/{len(chunks)}...", end="", flush=True
                 )
-                result = transcribe_chunk(client, chunk, args.language)
+                result = transcribe_with_fallback(chunk, args.language)
 
                 for seg in result["segments"]:
                     all_segments.append(
@@ -391,33 +469,38 @@ def main():
         )
 
         translation = None
-        if (
-            not args.translate_only
-            and not is_english
-            and not args.no_translate
-            and args.format == "text"
-        ):
-            print("Translating to English...")
-            translations = []
-            for i, chunk in enumerate(chunks):
-                print(
-                    f"  Translating chunk {i + 1}/{len(chunks)}...", end="", flush=True
-                )
-                translations.append(translate_chunk(client, chunk))
-                print(" done")
-            translation = "\n".join(translations).strip()
+        if not args.translate_only and args.format == "text" and translate_to != "none":
+            if translate_to == "en":
+                if not is_english:
+                    print("Translating to English...")
+                    translations = []
+                    for i, chunk in enumerate(chunks):
+                        print(
+                            f"  Translating chunk {i + 1}/{len(chunks)}...", end="", flush=True
+                        )
+                        translations.append(translate_with_fallback(chunk))
+                        print(" done")
+                    translation = "\n".join(translations).strip()
+            else:
+                # GPT text translation — single call on full transcript preserves context
+                print(f"Translating to {translate_to} via GPT-4o-mini...")
+                try:
+                    translation = translate_text_gpt(client, full_transcript, translate_to)
+                except Exception as e:
+                    print(f"Warning: GPT translation failed ({e}), skipping translation.")
+                    translation = None
 
         with open(output_path, "w", encoding="utf-8") as f:
             if args.format == "text":
                 if args.translate_only:
-                    f.write("=== English Translation ===\n\n")
+                    f.write("=== Translation (en) ===\n\n")
                     f.write(full_transcript)
                 else:
                     f.write(f"[Language: {detected_language}]\n\n")
                     f.write("=== Original Transcript ===\n\n")
                     f.write(full_transcript)
                     if translation:
-                        f.write("\n\n=== English Translation ===\n\n")
+                        f.write(f"\n\n=== Translation ({translate_to}) ===\n\n")
                         f.write(translation)
                 f.write("\n")
             else:
